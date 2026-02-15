@@ -43,3 +43,24 @@ class Node0Output(BaseModel):
 class DocumentMetadata(BaseModel):
     doc_type: DocTypeEnum = Field(description="The legal type of the document")
     party: PartyEnum = Field(description="The party presenting the document (e.g., Plaintiff, Defendant)")
+
+# The 6 Core Legal Roles + 'Other'
+LegalRoleEnum = Literal[
+    "الوقائع",          # Facts: The story, events, timeline
+    "الطلبات",          # Requests: What they want the court to rule
+    "الدفوع",           # Defenses: Legal/procedural arguments against the other side
+    "المستندات",        # Evidence: References to attached documents/exhibits
+    "الأساس القانوني",  # Legal Basis: Citations of articles/law
+    "الإجراءات",        # Procedures: Case history, previous hearings
+    "غير محدد"          # Other/Noise: Introductions, pure admin text
+]
+
+class ClassifiedChunk(NormalizedChunk):
+    """
+    Extends NormalizedChunk with semantic classification.
+    """
+    role: LegalRoleEnum = Field(..., description="The semantic legal category of this text")
+    confidence: float = Field(default=1.0, description="Model confidence score (0.0-1.0)")
+
+class Node1Output(BaseModel):
+    classified_chunks: List[ClassifiedChunk]
