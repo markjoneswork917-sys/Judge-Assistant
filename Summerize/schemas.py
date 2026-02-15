@@ -64,3 +64,17 @@ class ClassifiedChunk(NormalizedChunk):
 
 class Node1Output(BaseModel):
     classified_chunks: List[ClassifiedChunk]
+
+
+class LegalBullet(BaseModel):
+    """Atomic legal idea with full traceability."""
+    bullet_id: str = Field(description="Unique ID for this bullet")
+    role: LegalRoleEnum = Field(description="Legal role inherited from source chunk")
+    bullet: str = Field(description="The atomic legal idea in formal Arabic")
+    source: List[str] = Field(description="Citation list, e.g. doc_id ص12 ف3")
+    party: PartyEnum = Field(description="Party inherited from source chunk")
+    chunk_id: str = Field(description="Back-reference to the source ClassifiedChunk")
+
+
+class Node2Output(BaseModel):
+    bullets: List[LegalBullet]
