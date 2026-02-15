@@ -78,3 +78,44 @@ class LegalBullet(BaseModel):
 
 class Node2Output(BaseModel):
     bullets: List[LegalBullet]
+
+
+# --- Node 3 Output Schemas ---
+
+class AgreedBullet(BaseModel):
+    """An agreed-upon or uncontested fact in formal Arabic."""
+    text: str = Field(description="The agreed-upon fact in formal Arabic")
+    sources: List[str] = Field(description="Merged citations from all supporting bullets")
+
+
+class DisputePosition(BaseModel):
+    """One party's position within a disputed point."""
+    party: PartyEnum = Field(description="The party taking this position")
+    bullets: List[str] = Field(description="Exact original bullet texts from this party")
+    sources: List[str] = Field(description="Citations for these bullets")
+
+
+class DisputedPoint(BaseModel):
+    """A point of contention between parties."""
+    subject: str = Field(description="Brief label for what is disputed")
+    positions: List[DisputePosition] = Field(description="Each party's position with exact text")
+
+
+class PartyBullet(BaseModel):
+    """A point unique to one party, not contested or matched."""
+    party: PartyEnum = Field(description="The party this point belongs to")
+    text: str = Field(description="The bullet text")
+    sources: List[str] = Field(description="Citations")
+
+
+class RoleAggregation(BaseModel):
+    """Complete aggregation output for one legal role."""
+    role: LegalRoleEnum = Field(description="The legal role this aggregation covers")
+    agreed: List[AgreedBullet]
+    disputed: List[DisputedPoint]
+    party_specific: List[PartyBullet]
+
+
+class Node3Output(BaseModel):
+    """Full output of Node 3: per-role aggregations."""
+    role_aggregations: List[RoleAggregation]
