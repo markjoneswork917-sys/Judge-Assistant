@@ -5,10 +5,13 @@ Multi-stage error correction pipeline targeting Arabic legal text.
 
 Handles:
 - Unicode normalization (alef variants, teh marbuta, etc.)
-- RTL text ordering
+- RTL text ordering verification
 - Dictionary-based correction for medium-confidence words
+- Contextual correction for common Arabic OCR confusions
 - Legal pattern validation
+- Digit normalization
 - Whitespace and punctuation cleanup
+- Structural cleanup (merge split lines, remove repeated headers)
 """
 
 import logging
@@ -24,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 # Legal dictionary cache
 _legal_dictionary: Optional[Set[str]] = None
+
+# Arabic-Indic digit mapping
+_WESTERN_TO_ARABIC_INDIC = str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669")
+_ARABIC_INDIC_TO_WESTERN = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669", "0123456789")
 
 
 def load_legal_dictionary() -> Set[str]:
@@ -64,7 +71,7 @@ def postprocess_page(page_result: OCRPageResult) -> OCRPageResult:
     Apply all post-processing steps to a page result.
 
     Args:
-        page_result: Raw OCR page result.
+        page_result: Raw OCR page result from the engine.
 
     Returns:
         Corrected OCRPageResult with cleaned text and updated lines.
@@ -75,6 +82,9 @@ def postprocess_page(page_result: OCRPageResult) -> OCRPageResult:
         corrected_words = []
         for word in line.words:
             corrected_text = normalize_arabic(word.text)
+
+            # Normalize digits
+            corrected_text = normalize_digits(corrected_text)
 
             # Apply dictionary correction for medium-confidence words
             if (
@@ -95,6 +105,7 @@ def postprocess_page(page_result: OCRPageResult) -> OCRPageResult:
 
         line_text = " ".join(w.text for w in corrected_words)
         line_text = fix_whitespace(line_text)
+        line_text = fix_intra_word_spaces(line_text)
         line_text = validate_legal_patterns(line_text)
 
         corrected_lines.append(
@@ -104,6 +115,9 @@ def postprocess_page(page_result: OCRPageResult) -> OCRPageResult:
                 confidence=line.confidence,
             )
         )
+
+    # Structural cleanup: merge lines split mid-word
+    corrected_lines = merge_split_lines(corrected_lines)
 
     raw_text = "\n".join(line.text for line in corrected_lines)
 
@@ -117,13 +131,80 @@ def postprocess_page(page_result: OCRPageResult) -> OCRPageResult:
     )
 
 
+def postprocess_document_pages(pages: List[OCRPageResult]) -> List[OCRPageResult]:
+    """
+    Apply document-level post-processing across pages.
+
+    Handles repeated headers/footers that appear across multiple pages.
+    """
+    if len(pages) < 3:
+        return pages
+
+    # Detect repeated first/last lines across pages (headers/footers)
+    first_lines = []
+    last_lines = []
+
+    for page in pages:
+        if page.lines:
+            first_lines.append(page.lines[0].text.strip())
+            last_lines.append(page.lines[-1].text.strip())
+
+    # A line repeated on >50% of pages is likely a header/footer
+    threshold = len(pages) * 0.5
+
+    repeated_headers = set()
+    repeated_footers = set()
+
+    for line_text in set(first_lines):
+        if first_lines.count(line_text) > threshold and line_text:
+            repeated_headers.add(line_text)
+
+    for line_text in set(last_lines):
+        if last_lines.count(line_text) > threshold and line_text:
+            repeated_footers.add(line_text)
+
+    if not repeated_headers and not repeated_footers:
+        return pages
+
+    logger.info(
+        "Removing %d repeated headers, %d repeated footers",
+        len(repeated_headers),
+        len(repeated_footers),
+    )
+
+    cleaned_pages = []
+    for page in pages:
+        lines = list(page.lines)
+
+        # Remove repeated header
+        if lines and lines[0].text.strip() in repeated_headers:
+            lines = lines[1:]
+
+        # Remove repeated footer
+        if lines and lines[-1].text.strip() in repeated_footers:
+            lines = lines[:-1]
+
+        raw_text = "\n".join(line.text for line in lines)
+        cleaned_pages.append(
+            OCRPageResult(
+                page_number=page.page_number,
+                lines=lines,
+                raw_text=raw_text,
+                confidence=page.confidence,
+                warnings=page.warnings,
+                has_errors=page.has_errors,
+            )
+        )
+
+    return cleaned_pages
+
+
 def normalize_arabic(text: str) -> str:
     """
     Normalize Arabic Unicode characters.
 
     Handles:
     - Alef variants (alef with hamza, madda, etc.) -> bare alef
-    - Teh marbuta -> heh normalization (optional, conservative)
     - Remove tatweel (kashida)
     - Remove zero-width characters
     - Remove directional marks
@@ -152,6 +233,25 @@ def normalize_arabic(text: str) -> str:
     text = unicodedata.normalize("NFC", text)
 
     return text
+
+
+def normalize_digits(text: str) -> str:
+    """
+    Normalize digit representation based on config.
+
+    Options:
+    - 'arabic_indic': Convert Western digits to Arabic-Indic (٠١٢...)
+    - 'western': Convert Arabic-Indic digits to Western (012...)
+    - 'preserve': Leave digits as-is
+    """
+    mode = config.NORMALIZE_DIGITS
+
+    if mode == "arabic_indic":
+        return text.translate(_WESTERN_TO_ARABIC_INDIC)
+    elif mode == "western":
+        return text.translate(_ARABIC_INDIC_TO_WESTERN)
+    else:
+        return text
 
 
 def dictionary_correct(word: str) -> str:
@@ -246,6 +346,64 @@ def fix_whitespace(text: str) -> str:
     text = text.strip()
 
     return text
+
+
+def fix_intra_word_spaces(text: str) -> str:
+    """
+    Fix extra spaces within Arabic words (common OCR artifact).
+
+    Detects patterns where single Arabic letters are separated by spaces
+    and merges them back into words.
+    """
+    # Match sequences of 3+ single Arabic letters separated by spaces
+    # e.g. "م ح ك م ة" -> "محكمة"
+    arabic_letter = r"[\u0600-\u06FF]"
+    pattern = rf"(?<![^\s]){arabic_letter}(?:\s+{arabic_letter}){{2,}}(?![^\s])"
+
+    def _merge(match):
+        return re.sub(r"\s+", "", match.group(0))
+
+    return re.sub(pattern, _merge, text)
+
+
+def merge_split_lines(lines: List[OCRLine]) -> List[OCRLine]:
+    """
+    Merge lines that were incorrectly split mid-word.
+
+    If a line ends with a connecting Arabic character and the next line
+    starts with one, they were likely part of the same line.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    # Arabic connecting characters (letters that connect to the next letter)
+    connecting_chars = set(
+        "\u0628\u062a\u062b\u062c\u062d\u062e\u0633\u0634\u0635\u0636"
+        "\u0637\u0638\u0639\u063a\u0641\u0642\u0643\u0644\u0645\u0646"
+        "\u0647\u064a"
+    )
+
+    merged = [lines[0]]
+
+    for line in lines[1:]:
+        prev_text = merged[-1].text.rstrip()
+        curr_text = line.text.lstrip()
+
+        if prev_text and curr_text and prev_text[-1] in connecting_chars:
+            # Merge: concatenate without space (mid-word split)
+            new_text = prev_text + curr_text
+            new_words = list(merged[-1].words) + list(line.words)
+            avg_conf = (merged[-1].confidence + line.confidence) / 2
+
+            merged[-1] = OCRLine(
+                words=new_words,
+                text=new_text,
+                confidence=avg_conf,
+            )
+        else:
+            merged.append(line)
+
+    return merged
 
 
 def validate_legal_patterns(text: str) -> str:

@@ -1,242 +1,305 @@
 """
 engine.py
 
-EasyOCR wrapper with confidence scoring.
+Surya OCR engine wrapper with confidence scoring.
 
-Provides a singleton reader instance for efficient reuse across
-multiple calls, maps EasyOCR output into structured schema objects,
-and computes word, line, and page-level confidence scores.
+Uses Surya's two-stage pipeline:
+1. Text Detection — finds text line bounding boxes with reading order
+2. Text Recognition — recognizes characters with per-line confidence
+
+Provides lazy model loading, GPU auto-detection, and batched inference
+for efficient processing of multi-page documents.
 """
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-import numpy as np
+from PIL import Image
 
 from . import config
 from .schemas import OCRLine, OCRPageResult, OCRWord
 
 logger = logging.getLogger(__name__)
 
-# Singleton reader instance
-_reader = None
 
-
-def _get_reader():
+class SuryaOCREngine:
     """
-    Lazy-initialize the EasyOCR reader singleton.
+    Wrapper around Surya's detection and recognition models.
 
-    Creates the reader on first call and reuses it for all subsequent calls.
-    Auto-detects GPU availability, falling back to CPU.
+    Models are loaded lazily on first use and cached for reuse.
+    GPU is auto-detected with fallback to CPU.
     """
-    global _reader
-    if _reader is not None:
-        return _reader
 
-    try:
-        import easyocr
-    except ImportError:
-        raise ImportError(
-            "easyocr is required. Install it with: pip install easyocr"
-        )
+    def __init__(self):
+        self._det_model = None
+        self._rec_model = None
+        self._det_processor = None
+        self._rec_processor = None
+        self._models_loaded = False
 
-    use_gpu = config.USE_GPU
-    try:
-        import torch
+    def _load_models(self) -> None:
+        """
+        Lazy-load Surya detection and recognition models.
 
-        if use_gpu and not torch.cuda.is_available():
-            logger.info("CUDA not available, falling back to CPU")
+        Called automatically on first inference. Models are cached
+        for all subsequent calls.
+        """
+        if self._models_loaded:
+            return
+
+        try:
+            from surya.model.detection.model import load_model as load_det_model
+            from surya.model.detection.processor import (
+                load_processor as load_det_processor,
+            )
+            from surya.model.recognition.model import load_model as load_rec_model
+            from surya.model.recognition.processor import (
+                load_processor as load_rec_processor,
+            )
+        except ImportError:
+            raise ImportError(
+                "surya-ocr is required. Install it with: pip install surya-ocr"
+            )
+
+        use_gpu = config.USE_GPU
+        try:
+            import torch
+
+            if use_gpu and not torch.cuda.is_available():
+                logger.info("CUDA not available, falling back to CPU")
+                use_gpu = False
+        except ImportError:
+            logger.info("PyTorch not found, using CPU mode")
             use_gpu = False
-    except ImportError:
-        logger.info("PyTorch not found, using CPU mode")
-        use_gpu = False
 
-    logger.info(
-        "Initializing EasyOCR reader (language=%s, gpu=%s)",
-        config.OCR_LANGUAGE,
-        use_gpu,
-    )
-    _reader = easyocr.Reader(
-        lang_list=[config.OCR_LANGUAGE],
-        gpu=use_gpu,
-    )
-    return _reader
+        logger.info("Loading Surya models (gpu=%s)...", use_gpu)
 
+        self._det_processor = load_det_processor()
+        self._det_model = load_det_model()
+        self._rec_processor = load_rec_processor()
+        self._rec_model = load_rec_model()
 
-def reset_reader():
-    """Reset the singleton reader (useful for testing)."""
-    global _reader
-    _reader = None
+        if not use_gpu:
+            self._det_model = self._det_model.cpu()
+            self._rec_model = self._rec_model.cpu()
 
+        self._models_loaded = True
+        logger.info("Surya models loaded successfully")
 
-def run_ocr(image: np.ndarray, page_number: int = 1) -> OCRPageResult:
-    """
-    Run EasyOCR on a single preprocessed image and return structured results.
+    def process(self, images: List[Image.Image]) -> List[OCRPageResult]:
+        """
+        Run the full Surya pipeline (detect + recognize) on a list of images.
 
-    Args:
-        image: Preprocessed image as numpy array (grayscale or BGR).
-        page_number: 1-based page number for the result.
+        Args:
+            images: List of PIL Images in RGB mode.
 
-    Returns:
-        OCRPageResult with lines, confidence scores, and any warnings.
-    """
-    warnings: List[str] = []
+        Returns:
+            List of OCRPageResult, one per input image.
+        """
+        self._load_models()
 
-    try:
-        reader = _get_reader()
-        raw_results = reader.readtext(image, detail=1)
-    except Exception as e:
-        logger.error("EasyOCR engine error: %s", e)
-        return OCRPageResult(
-            page_number=page_number,
-            lines=[],
-            raw_text="",
-            confidence=0.0,
-            warnings=[f"OCR engine error: {str(e)}"],
-            has_errors=True,
+        try:
+            from surya.detection import batch_text_detection
+            from surya.recognition import batch_recognition
+        except ImportError:
+            raise ImportError(
+                "surya-ocr is required. Install it with: pip install surya-ocr"
+            )
+
+        results = []
+        batch_size = config.SURYA_BATCH_SIZE
+
+        # Process in batches to manage memory
+        for batch_start in range(0, len(images), batch_size):
+            batch_images = images[batch_start : batch_start + batch_size]
+            batch_results = self._process_batch(
+                batch_images,
+                batch_text_detection,
+                batch_recognition,
+                page_offset=batch_start,
+            )
+            results.extend(batch_results)
+
+        return results
+
+    def _process_batch(
+        self,
+        images: List[Image.Image],
+        batch_text_detection,
+        batch_recognition,
+        page_offset: int = 0,
+    ) -> List[OCRPageResult]:
+        """Process a single batch of images through detection and recognition."""
+        page_results = []
+
+        for i, image in enumerate(images):
+            page_num = page_offset + i + 1
+
+            try:
+                page_result = self._process_single_image(
+                    image, batch_text_detection, batch_recognition, page_num
+                )
+            except Exception as e:
+                logger.error("Surya engine error on page %d: %s", page_num, e)
+                page_result = OCRPageResult(
+                    page_number=page_num,
+                    lines=[],
+                    raw_text="",
+                    confidence=0.0,
+                    warnings=[f"OCR engine error: {str(e)}"],
+                    has_errors=True,
+                )
+
+            page_results.append(page_result)
+
+        return page_results
+
+    def _process_single_image(
+        self,
+        image: Image.Image,
+        batch_text_detection,
+        batch_recognition,
+        page_number: int,
+    ) -> OCRPageResult:
+        """Process a single image through Surya detection and recognition."""
+        warnings: List[str] = []
+
+        # Stage 1: Text Detection
+        det_results = batch_text_detection(
+            [image], self._det_model, self._det_processor
         )
 
-    if not raw_results:
+        if not det_results or not det_results[0].bboxes:
+            return OCRPageResult(
+                page_number=page_number,
+                lines=[],
+                raw_text="",
+                confidence=0.0,
+                warnings=["No text detected on page"],
+                has_errors=False,
+            )
+
+        # Stage 2: Text Recognition
+        langs = [[config.OCR_LANGUAGE]] * 1  # One language list per image
+        rec_results = batch_recognition(
+            [image], langs, self._rec_model, self._rec_processor, det_results
+        )
+
+        if not rec_results or not rec_results[0].text_lines:
+            return OCRPageResult(
+                page_number=page_number,
+                lines=[],
+                raw_text="",
+                confidence=0.0,
+                warnings=["Recognition produced no text"],
+                has_errors=False,
+            )
+
+        # Convert Surya results to our schema
+        rec_result = rec_results[0]
+        lines = []
+
+        for text_line in rec_result.text_lines:
+            text = text_line.text.strip()
+            if not text:
+                continue
+
+            confidence = getattr(text_line, "confidence", 0.0)
+            bbox = getattr(text_line, "bbox", [0, 0, 0, 0])
+
+            # Convert bbox [x1, y1, x2, y2] to corner points format
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                corner_points = [
+                    (float(x1), float(y1)),
+                    (float(x2), float(y1)),
+                    (float(x2), float(y2)),
+                    (float(x1), float(y2)),
+                ]
+            else:
+                corner_points = [(0.0, 0.0)] * 4
+
+            # Create a single word per line (Surya returns line-level text)
+            word = OCRWord(
+                text=text,
+                bbox=corner_points,
+                confidence=float(confidence),
+            )
+
+            line = OCRLine(
+                words=[word],
+                text=text,
+                confidence=float(confidence),
+            )
+
+            # Flag low-confidence lines
+            if confidence < config.MEDIUM_CONFIDENCE_THRESHOLD:
+                warnings.append(
+                    f"Low confidence ({confidence:.2f}) for: '{text[:50]}'"
+                )
+
+            lines.append(line)
+
+        # Compute page-level confidence
+        page_confidence = _compute_page_confidence(lines)
+
+        # Build raw text
+        raw_text = "\n".join(line.text for line in lines)
+
         return OCRPageResult(
             page_number=page_number,
-            lines=[],
-            raw_text="",
-            confidence=0.0,
-            warnings=["No text detected on page"],
+            lines=lines,
+            raw_text=raw_text,
+            confidence=page_confidence,
+            warnings=warnings,
             has_errors=False,
         )
 
-    # Convert raw results to OCRWord objects
-    words = _parse_raw_results(raw_results)
-
-    # Group words into lines based on vertical position
-    lines = _group_words_into_lines(words)
-
-    # Flag low-confidence words
-    for line in lines:
-        for word in line.words:
-            if word.confidence < config.MEDIUM_CONFIDENCE_THRESHOLD:
-                warnings.append(
-                    f"Low confidence ({word.confidence:.2f}) for: '{word.text}'"
-                )
-
-    # Compute page-level confidence
-    page_confidence = _compute_page_confidence(lines)
-
-    # Build raw text
-    raw_text = "\n".join(line.text for line in lines)
-
-    return OCRPageResult(
-        page_number=page_number,
-        lines=lines,
-        raw_text=raw_text,
-        confidence=page_confidence,
-        warnings=warnings,
-        has_errors=False,
-    )
+    def reset(self) -> None:
+        """Release models and free memory."""
+        self._det_model = None
+        self._rec_model = None
+        self._det_processor = None
+        self._rec_processor = None
+        self._models_loaded = False
+        logger.info("Surya models released")
 
 
-def _parse_raw_results(
-    raw_results: List[Tuple],
-) -> List[OCRWord]:
+# Module-level singleton engine
+_engine: Optional[SuryaOCREngine] = None
+
+
+def get_engine() -> SuryaOCREngine:
+    """Get or create the singleton Surya OCR engine."""
+    global _engine
+    if _engine is None:
+        _engine = SuryaOCREngine()
+    return _engine
+
+
+def reset_engine() -> None:
+    """Reset the singleton engine (useful for testing)."""
+    global _engine
+    if _engine is not None:
+        _engine.reset()
+    _engine = None
+
+
+def run_ocr(images: List[Image.Image]) -> List[OCRPageResult]:
     """
-    Parse EasyOCR raw output into OCRWord objects.
+    Run Surya OCR on a list of PIL Images.
 
-    EasyOCR returns: [(bbox, text, confidence), ...]
-    where bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    This is the main entry point for the engine module.
+    Uses the singleton engine with lazy model loading.
+
+    Args:
+        images: List of PIL Images in RGB mode.
+
+    Returns:
+        List of OCRPageResult, one per input image.
     """
-    words = []
-    for bbox, text, conf in raw_results:
-        if not text.strip():
-            continue
-        words.append(
-            OCRWord(
-                text=text.strip(),
-                bbox=[(float(p[0]), float(p[1])) for p in bbox],
-                confidence=float(conf),
-            )
-        )
-    return words
-
-
-def _group_words_into_lines(words: List[OCRWord]) -> List[OCRLine]:
-    """
-    Group words into lines based on vertical proximity of bounding boxes.
-
-    Words whose vertical centers are within a threshold are considered
-    to be on the same line. Lines are sorted top-to-bottom, and words
-    within each line are sorted right-to-left (for Arabic RTL text).
-    """
-    if not words:
-        return []
-
-    # Compute vertical center for each word
-    def v_center(word: OCRWord) -> float:
-        ys = [p[1] for p in word.bbox]
-        return sum(ys) / len(ys)
-
-    def h_center(word: OCRWord) -> float:
-        xs = [p[0] for p in word.bbox]
-        return sum(xs) / len(xs)
-
-    def word_height(word: OCRWord) -> float:
-        ys = [p[1] for p in word.bbox]
-        return max(ys) - min(ys)
-
-    # Sort by vertical position first
-    sorted_words = sorted(words, key=v_center)
-
-    # Group into lines using vertical proximity
-    lines_groups: List[List[OCRWord]] = []
-    current_group: List[OCRWord] = [sorted_words[0]]
-
-    for word in sorted_words[1:]:
-        prev_center = v_center(current_group[-1])
-        curr_center = v_center(word)
-        threshold = max(word_height(word), word_height(current_group[-1])) * 0.5
-
-        if abs(curr_center - prev_center) <= threshold:
-            current_group.append(word)
-        else:
-            lines_groups.append(current_group)
-            current_group = [word]
-
-    lines_groups.append(current_group)
-
-    # Build OCRLine objects
-    lines = []
-    for group in lines_groups:
-        # Sort words right-to-left for Arabic
-        group.sort(key=h_center, reverse=True)
-
-        line_text = " ".join(w.text for w in group)
-        line_confidence = _compute_weighted_confidence(group)
-
-        lines.append(
-            OCRLine(
-                words=group,
-                text=line_text,
-                confidence=line_confidence,
-            )
-        )
-
-    return lines
-
-
-def _compute_weighted_confidence(words: List[OCRWord]) -> float:
-    """
-    Compute weighted average confidence for a list of words.
-    Weight is proportional to word length (longer words contribute more).
-    """
-    if not words:
-        return 0.0
-
-    total_weight = sum(len(w.text) for w in words)
-    if total_weight == 0:
-        return 0.0
-
-    weighted_sum = sum(w.confidence * len(w.text) for w in words)
-    return weighted_sum / total_weight
+    engine = get_engine()
+    return engine.process(images)
 
 
 def _compute_page_confidence(lines: List[OCRLine]) -> float:

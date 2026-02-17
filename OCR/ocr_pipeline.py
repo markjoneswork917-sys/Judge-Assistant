@@ -3,9 +3,11 @@ ocr_pipeline.py
 
 Main orchestrator for the OCR module.
 
-Coordinates the full pipeline: loading -> preprocessing -> OCR -> post-processing.
+Coordinates the full pipeline: loading -> preprocessing -> Surya OCR -> post-processing.
 Supports single-file and batch processing, with an option to return results
 formatted for the Summarization pipeline's Node 0.
+
+Uses Surya's native batch processing for efficient GPU inference.
 """
 
 import logging
@@ -13,11 +15,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Union
 
-import numpy as np
+from PIL import Image
 
 from . import config
 from .engine import run_ocr
-from .postprocessor import postprocess_page
+from .postprocessor import postprocess_document_pages, postprocess_page
 from .preprocessor import preprocess_image
 from .schemas import OCRDocumentResult, OCRPageResult
 from .utils import load_images
@@ -26,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def process_document(
-    file_path: str,
+    file_path: Union[str, List[str]],
     return_for_node0: bool = False,
     doc_id: Optional[str] = None,
 ) -> Union[OCRDocumentResult, List[Dict]]:
@@ -34,7 +36,8 @@ def process_document(
     Process a document through the full OCR pipeline.
 
     Args:
-        file_path: Path to an image or PDF file.
+        file_path: Path to an image or PDF file, or list of image paths
+            for a multi-page document.
         return_for_node0: If True, return in the format expected by
             SummarizationState.documents: [{"raw_text": "...", "doc_id": "..."}]
         doc_id: Optional document identifier. Auto-generated if not provided.
@@ -49,46 +52,53 @@ def process_document(
     logger.info("Processing document: %s (doc_id=%s)", file_path, doc_id)
 
     # 1. Load images
-    images = load_images(file_path)
-    logger.info("Loaded %d page(s)", len(images))
+    if isinstance(file_path, list):
+        all_images: List[Image.Image] = []
+        for fp in file_path:
+            all_images.extend(load_images(fp))
+        display_path = str(file_path[0]) if file_path else "unknown"
+    else:
+        all_images = load_images(file_path)
+        display_path = str(file_path)
 
-    # 2. Process each page
-    page_results: List[OCRPageResult] = []
-    all_warnings: List[str] = []
+    logger.info("Loaded %d page(s)", len(all_images))
 
-    for i, image in enumerate(images):
-        page_num = i + 1
-        logger.info("Processing page %d/%d", page_num, len(images))
-
-        # Preprocess
+    # 2. Preprocess each image
+    preprocessed_images: List[Image.Image] = []
+    for i, image in enumerate(all_images):
+        logger.info("Preprocessing page %d/%d", i + 1, len(all_images))
         preprocessed = preprocess_image(image)
+        preprocessed_images.append(preprocessed)
 
-        # Run OCR
-        page_result = run_ocr(preprocessed, page_number=page_num)
+    # 3. Run Surya OCR (batched)
+    logger.info("Running Surya OCR on %d page(s)...", len(preprocessed_images))
+    page_results = run_ocr(preprocessed_images)
 
-        # Post-process
-        page_result = postprocess_page(page_result)
+    # 4. Post-process each page
+    all_warnings: List[str] = []
+    postprocessed_pages: List[OCRPageResult] = []
 
-        page_results.append(page_result)
-        all_warnings.extend(page_result.warnings)
+    for page_result in page_results:
+        corrected = postprocess_page(page_result)
+        postprocessed_pages.append(corrected)
+        all_warnings.extend(corrected.warnings)
 
-        # Release image memory
-        del image
-        del preprocessed
+    # 5. Document-level post-processing (header/footer removal)
+    postprocessed_pages = postprocess_document_pages(postprocessed_pages)
 
-    # 3. Combine results
+    # 6. Combine results
     combined_text = "\n\n".join(
-        page.raw_text for page in page_results if page.raw_text
+        page.raw_text for page in postprocessed_pages if page.raw_text
     )
 
-    overall_confidence = _compute_document_confidence(page_results)
+    overall_confidence = _compute_document_confidence(postprocessed_pages)
 
     result = OCRDocumentResult(
-        file_path=str(file_path),
+        file_path=display_path,
         doc_id=doc_id,
-        pages=page_results,
+        pages=postprocessed_pages,
         raw_text=combined_text,
-        total_pages=len(page_results),
+        total_pages=len(postprocessed_pages),
         overall_confidence=overall_confidence,
         warnings=all_warnings,
     )
@@ -112,54 +122,40 @@ def process_batch(
     max_workers: Optional[int] = None,
 ) -> Union[List[OCRDocumentResult], List[Dict]]:
     """
-    Process multiple documents with optional concurrency.
+    Process multiple documents.
+
+    Note: Surya uses GPU internally with batched inference, so documents
+    are processed sequentially to avoid GPU memory contention. The batch
+    size for Surya's internal batching is controlled by config.SURYA_BATCH_SIZE.
 
     Args:
         file_paths: List of file paths to process.
         return_for_node0: If True, return in Node 0 format.
-        max_workers: Number of concurrent workers. Defaults to config.BATCH_WORKERS.
+        max_workers: Number of concurrent workers (used for CPU-bound
+            preprocessing only, not for GPU inference).
 
     Returns:
         List of OCRDocumentResult objects, or list of dicts for Node 0.
     """
-    if max_workers is None:
-        max_workers = config.BATCH_WORKERS
-
     results: List[OCRDocumentResult] = []
-    node0_results: List[Dict] = []
 
-    # For single file or small batches, process sequentially
-    if len(file_paths) <= 1 or max_workers <= 1:
-        for fp in file_paths:
+    for fp in file_paths:
+        try:
             result = process_document(fp, return_for_node0=False)
             results.append(result)
-    else:
-        # Use thread pool for concurrent processing
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_path = {
-                executor.submit(process_document, fp, False): fp
-                for fp in file_paths
-            }
-
-            for future in as_completed(future_to_path):
-                fp = future_to_path[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    logger.error("Failed to process %s: %s", fp, e)
-                    # Create an error result
-                    results.append(
-                        OCRDocumentResult(
-                            file_path=str(fp),
-                            doc_id=str(uuid.uuid4())[:8],
-                            pages=[],
-                            raw_text="",
-                            total_pages=0,
-                            overall_confidence=0.0,
-                            warnings=[f"Processing failed: {str(e)}"],
-                        )
-                    )
+        except Exception as e:
+            logger.error("Failed to process %s: %s", fp, e)
+            results.append(
+                OCRDocumentResult(
+                    file_path=str(fp),
+                    doc_id=str(uuid.uuid4())[:8],
+                    pages=[],
+                    raw_text="",
+                    total_pages=0,
+                    overall_confidence=0.0,
+                    warnings=[f"Processing failed: {str(e)}"],
+                )
+            )
 
     if return_for_node0:
         return [
