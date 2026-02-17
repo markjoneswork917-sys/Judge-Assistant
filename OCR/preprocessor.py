@@ -1,12 +1,13 @@
 """
 preprocessor.py
 
-OpenCV-based image preprocessing pipeline to maximize OCR accuracy
+Image preprocessing pipeline to maximize OCR accuracy
 on Arabic legal documents.
 
-Each preprocessing step is independently toggleable via config.
-The pipeline returns processed images as numpy arrays ready for
-the EasyOCR engine.
+Surya handles many aspects internally, so preprocessing is lighter
+than with older engines like EasyOCR. Each step is independently
+toggleable via config. The pipeline works with PIL Images throughout,
+converting to OpenCV format only for specific operations.
 """
 
 import logging
@@ -15,6 +16,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from . import config
 
@@ -22,28 +24,30 @@ logger = logging.getLogger(__name__)
 
 
 def preprocess_image(
-    image: np.ndarray,
+    image: Image.Image,
     enable_denoise: Optional[bool] = None,
     enable_deskew: Optional[bool] = None,
     enable_border_removal: Optional[bool] = None,
     enable_contrast_enhancement: Optional[bool] = None,
-    binarization_method: Optional[str] = None,
-    target_dpi: Optional[int] = None,
-) -> np.ndarray:
+    enable_resolution_check: Optional[bool] = None,
+) -> Image.Image:
     """
-    Run the full preprocessing pipeline on a single image.
+    Run the preprocessing pipeline on a single PIL Image.
+
+    Surya works well with RGB input, so we avoid aggressive binarization.
+    The pipeline focuses on resolution, deskewing, border removal, and
+    contrast enhancement.
 
     Args:
-        image: Input image as BGR numpy array.
+        image: Input PIL Image in RGB mode.
         enable_denoise: Override config ENABLE_DENOISE.
         enable_deskew: Override config ENABLE_DESKEW.
         enable_border_removal: Override config ENABLE_BORDER_REMOVAL.
         enable_contrast_enhancement: Override config ENABLE_CONTRAST_ENHANCEMENT.
-        binarization_method: Override config BINARIZATION_METHOD.
-        target_dpi: Override config TARGET_DPI.
+        enable_resolution_check: Override config ENABLE_RESOLUTION_CHECK.
 
     Returns:
-        Preprocessed image as numpy array.
+        Preprocessed PIL Image in RGB mode, ready for Surya.
     """
     if enable_denoise is None:
         enable_denoise = config.ENABLE_DENOISE
@@ -53,117 +57,83 @@ def preprocess_image(
         enable_border_removal = config.ENABLE_BORDER_REMOVAL
     if enable_contrast_enhancement is None:
         enable_contrast_enhancement = config.ENABLE_CONTRAST_ENHANCEMENT
-    if binarization_method is None:
-        binarization_method = config.BINARIZATION_METHOD
-    if target_dpi is None:
-        target_dpi = config.TARGET_DPI
+    if enable_resolution_check is None:
+        enable_resolution_check = config.ENABLE_RESOLUTION_CHECK
 
     result = image.copy()
 
-    # 1. Grayscale conversion
-    result = to_grayscale(result)
-    logger.debug("Grayscale conversion done")
+    # 1. Resolution check — upscale low-res images
+    if enable_resolution_check:
+        result = check_and_upscale_resolution(result)
+        logger.debug("Resolution check done")
 
-    # 2. Noise removal
-    if enable_denoise:
-        result = denoise(result)
-        logger.debug("Denoising done")
-
-    # 3. Contrast enhancement (CLAHE) - applied before binarization
-    if enable_contrast_enhancement:
-        result = enhance_contrast(result)
-        logger.debug("Contrast enhancement done")
-
-    # 4. Binarization
-    result = binarize(result, method=binarization_method)
-    logger.debug("Binarization done (method: %s)", binarization_method)
-
-    # 5. Deskewing
+    # 2. Deskewing — correct rotation
     if enable_deskew:
         result = deskew(result)
         logger.debug("Deskewing done")
 
-    # 6. Border removal
+    # 3. Border removal — crop black scan borders
     if enable_border_removal:
         result = remove_borders(result)
         logger.debug("Border removal done")
 
-    # 7. Resolution normalization
-    result = normalize_resolution(result, target_dpi=target_dpi)
-    logger.debug("Resolution normalization done")
+    # 4. Contrast enhancement — CLAHE for faded documents
+    if enable_contrast_enhancement:
+        result = enhance_contrast(result)
+        logger.debug("Contrast enhancement done")
+
+    # 5. Noise removal — optional, off by default since Surya is robust
+    if enable_denoise:
+        result = denoise(result)
+        logger.debug("Denoising done")
 
     return result
 
 
-def to_grayscale(image: np.ndarray) -> np.ndarray:
-    """Convert image to grayscale. If already grayscale, return as-is."""
-    if len(image.shape) == 2:
+def check_and_upscale_resolution(image: Image.Image) -> Image.Image:
+    """
+    Ensure minimum resolution for OCR accuracy.
+
+    If the image height is below what a standard A4 page would be
+    at MIN_DPI, upscale using Lanczos interpolation.
+    """
+    min_dpi = config.MIN_DPI
+
+    # A4 page at min DPI: 297mm * (dpi / 25.4)
+    expected_height_at_min = int(min_dpi * 11.69)
+
+    w, h = image.size
+
+    if h >= expected_height_at_min:
         return image
-    if len(image.shape) == 3 and image.shape[2] == 1:
-        return image[:, :, 0]
-    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    scale = expected_height_at_min / h
+    # Cap upscaling at 3x to avoid excessive memory use
+    scale = min(scale, 3.0)
+
+    if scale <= 1.05:
+        return image
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    logger.info("Upscaling image from %dx%d to %dx%d (%.1fx)", w, h, new_w, new_h, scale)
+    return image.resize((new_w, new_h), Image.LANCZOS)
 
 
-def denoise(image: np.ndarray) -> np.ndarray:
+def deskew(image: Image.Image) -> Image.Image:
     """
-    Remove noise using Non-Local Means denoising.
-
-    This works well for scanned documents where noise comes from
-    the scanning process.
-    """
-    return cv2.fastNlMeansDenoising(image, h=10, templateWindowSize=7, searchWindowSize=21)
-
-
-def enhance_contrast(image: np.ndarray) -> np.ndarray:
-    """
-    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    to improve contrast on faded documents.
-    """
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(image)
-
-
-def binarize(image: np.ndarray, method: str = "otsu") -> np.ndarray:
-    """
-    Convert to binary image using the specified thresholding method.
-
-    Args:
-        image: Grayscale image.
-        method: One of 'otsu', 'sauvola', 'adaptive'.
-
-    Returns:
-        Binary image (black text on white background).
-    """
-    if method == "otsu":
-        _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return binary
-    elif method == "adaptive":
-        return cv2.adaptiveThreshold(
-            image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-    elif method == "sauvola":
-        # Sauvola thresholding approximation using adaptive method
-        # with a larger block size suitable for document images
-        return cv2.adaptiveThreshold(
-            image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 8
-        )
-    else:
-        logger.warning("Unknown binarization method '%s', falling back to otsu", method)
-        _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return binary
-
-
-def deskew(image: np.ndarray) -> np.ndarray:
-    """
-    Detect and correct document rotation using minAreaRect on contours.
+    Detect and correct document rotation using Hough line transform.
 
     Handles small rotations typical of scanned documents (up to ~15 degrees).
+    Surya handles minor skew but large rotations need correction.
     """
-    # Find contours in a dilated version to get text block boundaries
-    coords = np.column_stack(np.where(image < 128))
+    # Convert to grayscale numpy array for OpenCV processing
+    gray = np.array(image.convert("L"))
+
+    coords = np.column_stack(np.where(gray < 128))
 
     if len(coords) < 50:
-        # Not enough dark pixels to determine skew
         return image
 
     angle = cv2.minAreaRect(coords)[-1]
@@ -179,38 +149,29 @@ def deskew(image: np.ndarray) -> np.ndarray:
     if abs(angle) > 15 or abs(angle) < 0.1:
         return image
 
-    h, w = image.shape[:2]
-    center = (w // 2, h // 2)
-    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(
-        image, rotation_matrix, (w, h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-
-    logger.info("Deskewed by %.2f degrees", angle)
-    return rotated
+    logger.info("Deskewing by %.2f degrees", angle)
+    return image.rotate(-angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
 
 
-def remove_borders(image: np.ndarray) -> np.ndarray:
+def remove_borders(image: Image.Image) -> Image.Image:
     """
     Remove black scan borders by finding the largest contour
     that represents the document area.
     """
+    gray = np.array(image.convert("L"))
+
     # Invert so document area is white
-    inverted = cv2.bitwise_not(image)
+    inverted = cv2.bitwise_not(gray)
 
     contours, _ = cv2.findContours(inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         return image
 
-    # Find the largest contour (should be the document)
     largest = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(largest)
 
-    # Only crop if the contour is at least 50% of the image area
-    img_area = image.shape[0] * image.shape[1]
+    img_area = gray.shape[0] * gray.shape[1]
     contour_area = w * h
     if contour_area < img_area * 0.5:
         return image
@@ -218,46 +179,44 @@ def remove_borders(image: np.ndarray) -> np.ndarray:
     # Add small padding
     pad = 5
     y_start = max(0, y - pad)
-    y_end = min(image.shape[0], y + h + pad)
+    y_end = min(gray.shape[0], y + h + pad)
     x_start = max(0, x - pad)
-    x_end = min(image.shape[1], x + w + pad)
+    x_end = min(gray.shape[1], x + w + pad)
 
-    return image[y_start:y_end, x_start:x_end]
+    return image.crop((x_start, y_start, x_end, y_end))
 
 
-def normalize_resolution(image: np.ndarray, target_dpi: int = 300) -> np.ndarray:
+def enhance_contrast(image: Image.Image) -> Image.Image:
     """
-    Upscale low-resolution images to meet target DPI.
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    to improve contrast on faded documents.
 
-    EasyOCR performs best at 300+ DPI. We estimate current DPI
-    from image dimensions and upscale if needed.
-
-    For images without embedded DPI info, we use a heuristic:
-    if the image height is less than what a standard A4 page
-    would be at target DPI, we upscale proportionally.
+    Works on the L channel in LAB color space to preserve color information.
     """
-    # A4 page at target DPI would be approximately:
-    # 297mm * (target_dpi / 25.4) ~= target_dpi * 11.69 inches
-    expected_height_at_target = int(target_dpi * 11.69)
+    arr = np.array(image)
 
-    h, w = image.shape[:2]
+    # Convert RGB to LAB
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
 
-    if h >= expected_height_at_target:
-        # Already at or above target resolution
-        return image
+    # Apply CLAHE to the L channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
 
-    # Calculate scale factor
-    scale = expected_height_at_target / h
+    # Convert back to RGB
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    # Cap upscaling at 3x to avoid excessive memory use
-    scale = min(scale, 3.0)
+    return Image.fromarray(enhanced)
 
-    if scale <= 1.05:
-        # Not worth upscaling for tiny improvements
-        return image
 
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+def denoise(image: Image.Image) -> Image.Image:
+    """
+    Remove noise using Non-Local Means denoising.
 
-    logger.info("Upscaling image from %dx%d to %dx%d (%.1fx)", w, h, new_w, new_h, scale)
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    Optional step — off by default since Surya is robust to noise.
+    """
+    arr = np.array(image)
+
+    # Use color denoising for RGB images (positional args for OpenCV compat)
+    denoised = cv2.fastNlMeansDenoisingColored(arr, None, 10, 10, 7, 21)
+
+    return Image.fromarray(denoised)

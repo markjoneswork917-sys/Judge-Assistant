@@ -8,15 +8,14 @@ Handles:
 - PDF-to-image conversion
 - File path sanitization against path traversal
 - File size enforcement
-- Memory-safe image loading
+- Returns PIL Images for Surya compatibility
 """
 
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Union
 
-import numpy as np
 from PIL import Image
 
 from . import config
@@ -100,18 +99,19 @@ def validate_file(file_path: Path) -> None:
         raise OCRFileError(f"File is empty: {file_path}")
 
 
-def load_images(file_path: Union[str, Path]) -> List[np.ndarray]:
+def load_images(file_path: Union[str, Path]) -> List[Image.Image]:
     """
-    Load image(s) from a file path.
+    Load image(s) from a file path as PIL Images.
 
     Supports PNG, JPEG, TIFF, BMP directly via Pillow.
     PDFs are converted to images using pdf2image.
+    Returns PIL Images in RGB mode, which is the format Surya expects.
 
     Args:
         file_path: Path to the image or PDF file.
 
     Returns:
-        List of numpy arrays (one per page), each in BGR format for OpenCV.
+        List of PIL Image objects (one per page) in RGB mode.
 
     Raises:
         OCRFileError: If loading fails.
@@ -134,18 +134,15 @@ def load_images(file_path: Union[str, Path]) -> List[np.ndarray]:
         raise OCRFileError(f"Failed to load image from {path.name}: {e}") from e
 
 
-def _load_single_image(path: Path) -> List[np.ndarray]:
-    """Load a single image file and return as a list with one numpy array."""
+def _load_single_image(path: Path) -> List[Image.Image]:
+    """Load a single image file and return as a list with one PIL Image."""
     img = Image.open(path)
     img_rgb = img.convert("RGB")
-    arr = np.array(img_rgb)
-    # Convert RGB to BGR for OpenCV compatibility
-    arr_bgr = arr[:, :, ::-1].copy()
-    logger.info("Loaded image: %dx%d", arr_bgr.shape[1], arr_bgr.shape[0])
-    return [arr_bgr]
+    logger.info("Loaded image: %dx%d", img_rgb.width, img_rgb.height)
+    return [img_rgb]
 
 
-def _load_pdf_images(path: Path) -> List[np.ndarray]:
+def _load_pdf_images(path: Path) -> List[Image.Image]:
     """
     Convert PDF pages to images using pdf2image.
 
@@ -161,16 +158,15 @@ def _load_pdf_images(path: Path) -> List[np.ndarray]:
         )
 
     try:
-        pil_images = convert_from_path(str(path), dpi=config.TARGET_DPI)
+        pil_images = convert_from_path(str(path), dpi=300)
     except Exception as e:
         raise OCRFileError(f"Failed to convert PDF: {e}") from e
 
     images = []
     for i, pil_img in enumerate(pil_images):
-        arr = np.array(pil_img.convert("RGB"))
-        arr_bgr = arr[:, :, ::-1].copy()
-        logger.info("PDF page %d: %dx%d", i + 1, arr_bgr.shape[1], arr_bgr.shape[0])
-        images.append(arr_bgr)
+        img_rgb = pil_img.convert("RGB")
+        logger.info("PDF page %d: %dx%d", i + 1, img_rgb.width, img_rgb.height)
+        images.append(img_rgb)
 
     if not images:
         raise OCRFileError(f"PDF produced no images: {path.name}")

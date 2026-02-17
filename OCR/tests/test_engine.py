@@ -1,7 +1,7 @@
 """
-Tests for the OCR engine module.
+Tests for the OCR engine module (Surya-based).
 
-Note: Tests that require the actual EasyOCR model are marked with
+Note: Tests that require the actual Surya model are marked with
 pytest.mark.integration and skipped by default. Unit tests use mocking.
 """
 
@@ -9,100 +9,193 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from OCR.engine import (
+    SuryaOCREngine,
     _compute_page_confidence,
-    _compute_weighted_confidence,
-    _group_words_into_lines,
-    _parse_raw_results,
-    reset_reader,
+    get_engine,
+    reset_engine,
     run_ocr,
 )
-from OCR.schemas import OCRLine, OCRWord
+from OCR.schemas import OCRLine, OCRPageResult, OCRWord
 
 
 @pytest.fixture(autouse=True)
 def _reset():
-    """Reset singleton reader before each test."""
-    reset_reader()
+    """Reset singleton engine before each test."""
+    reset_engine()
     yield
-    reset_reader()
+    reset_engine()
 
 
-class TestParseRawResults:
-    def test_parses_easyocr_output(self):
-        raw = [
-            ([[0, 0], [100, 0], [100, 30], [0, 30]], "مرحبا", 0.95),
-            ([[0, 40], [80, 40], [80, 70], [0, 70]], "عالم", 0.88),
+def _make_pil_image(w=400, h=500):
+    """Create a synthetic test PIL Image."""
+    arr = np.ones((h, w, 3), dtype=np.uint8) * 255
+    arr[100:120, 50:350] = 0  # Dark region simulating text
+    return Image.fromarray(arr)
+
+
+def _make_mock_det_result():
+    """Create a mock detection result."""
+    mock = MagicMock()
+    mock_bbox = MagicMock()
+    mock_bbox.bbox = [10, 10, 200, 40]
+    mock.bboxes = [mock_bbox]
+    return mock
+
+
+def _make_mock_rec_result(text="نص تجريبي", confidence=0.92):
+    """Create a mock recognition result."""
+    mock = MagicMock()
+    mock_text_line = MagicMock()
+    mock_text_line.text = text
+    mock_text_line.confidence = confidence
+    mock_text_line.bbox = [10, 10, 200, 40]
+    mock.text_lines = [mock_text_line]
+    return mock
+
+
+class TestSuryaOCREngine:
+    def test_engine_initializes_unloaded(self):
+        engine = SuryaOCREngine()
+        assert engine._models_loaded is False
+        assert engine._det_model is None
+        assert engine._rec_model is None
+
+    def test_reset_clears_models(self):
+        engine = SuryaOCREngine()
+        engine._models_loaded = True
+        engine._det_model = "fake"
+        engine.reset()
+        assert engine._models_loaded is False
+        assert engine._det_model is None
+
+    @patch("OCR.engine.SuryaOCREngine._load_models")
+    def test_process_calls_batch(self, mock_load):
+        engine = SuryaOCREngine()
+        engine._models_loaded = True
+
+        expected_result = OCRPageResult(
+            page_number=1,
+            lines=[],
+            raw_text="test",
+            confidence=0.9,
+        )
+
+        with patch.object(engine, "_process_batch", return_value=[expected_result]) as mock_batch:
+            # Mock the surya imports inside process()
+            mock_det = MagicMock()
+            mock_rec = MagicMock()
+            import sys
+            sys.modules["surya"] = MagicMock()
+            sys.modules["surya.detection"] = MagicMock(batch_text_detection=mock_det)
+            sys.modules["surya.recognition"] = MagicMock(batch_recognition=mock_rec)
+
+            try:
+                images = [_make_pil_image()]
+                results = engine.process(images)
+
+                mock_load.assert_called_once()
+                mock_batch.assert_called_once()
+                assert len(results) == 1
+            finally:
+                sys.modules.pop("surya", None)
+                sys.modules.pop("surya.detection", None)
+                sys.modules.pop("surya.recognition", None)
+
+
+class TestRunOCR:
+    @patch("OCR.engine.get_engine")
+    def test_returns_page_results(self, mock_get_engine):
+        mock_engine = MagicMock()
+        page_result = OCRPageResult(
+            page_number=1,
+            lines=[
+                OCRLine(
+                    words=[
+                        OCRWord(
+                            text="نص تجريبي",
+                            bbox=[(0, 0), (100, 0), (100, 30), (0, 30)],
+                            confidence=0.92,
+                        )
+                    ],
+                    text="نص تجريبي",
+                    confidence=0.92,
+                )
+            ],
+            raw_text="نص تجريبي",
+            confidence=0.92,
+        )
+        mock_engine.process.return_value = [page_result]
+        mock_get_engine.return_value = mock_engine
+
+        images = [_make_pil_image()]
+        results = run_ocr(images)
+
+        assert len(results) == 1
+        assert results[0].page_number == 1
+        assert "نص تجريبي" in results[0].raw_text
+        assert results[0].confidence > 0
+
+    @patch("OCR.engine.get_engine")
+    def test_handles_empty_results(self, mock_get_engine):
+        mock_engine = MagicMock()
+        mock_engine.process.return_value = [
+            OCRPageResult(
+                page_number=1,
+                lines=[],
+                raw_text="",
+                confidence=0.0,
+                warnings=["No text detected on page"],
+            )
         ]
-        words = _parse_raw_results(raw)
-        assert len(words) == 2
-        assert words[0].text == "مرحبا"
-        assert words[0].confidence == 0.95
-        assert words[1].text == "عالم"
+        mock_get_engine.return_value = mock_engine
 
-    def test_skips_empty_text(self):
-        raw = [
-            ([[0, 0], [100, 0], [100, 30], [0, 30]], "   ", 0.5),
-            ([[0, 40], [80, 40], [80, 70], [0, 70]], "نص", 0.9),
+        images = [_make_pil_image()]
+        results = run_ocr(images)
+
+        assert len(results) == 1
+        assert results[0].raw_text == ""
+        assert results[0].confidence == 0.0
+
+    @patch("OCR.engine.get_engine")
+    def test_handles_engine_error(self, mock_get_engine):
+        mock_engine = MagicMock()
+        mock_engine.process.return_value = [
+            OCRPageResult(
+                page_number=1,
+                lines=[],
+                raw_text="",
+                confidence=0.0,
+                warnings=["OCR engine error: test error"],
+                has_errors=True,
+            )
         ]
-        words = _parse_raw_results(raw)
-        assert len(words) == 1
-        assert words[0].text == "نص"
+        mock_get_engine.return_value = mock_engine
 
-    def test_empty_input(self):
-        assert _parse_raw_results([]) == []
+        images = [_make_pil_image()]
+        results = run_ocr(images)
 
+        assert results[0].has_errors is True
+        assert results[0].confidence == 0.0
+        assert len(results[0].warnings) > 0
 
-class TestGroupWordsIntoLines:
-    def test_groups_nearby_words(self):
-        words = [
-            OCRWord(text="كلمة", bbox=[(200, 10), (250, 10), (250, 30), (200, 30)], confidence=0.9),
-            OCRWord(text="أخرى", bbox=[(100, 12), (150, 12), (150, 32), (100, 32)], confidence=0.85),
+    @patch("OCR.engine.get_engine")
+    def test_multiple_pages(self, mock_get_engine):
+        mock_engine = MagicMock()
+        mock_engine.process.return_value = [
+            OCRPageResult(page_number=1, lines=[], raw_text="page1", confidence=0.9),
+            OCRPageResult(page_number=2, lines=[], raw_text="page2", confidence=0.85),
         ]
-        lines = _group_words_into_lines(words)
-        assert len(lines) == 1
-        assert "كلمة" in lines[0].text
-        assert "أخرى" in lines[0].text
+        mock_get_engine.return_value = mock_engine
 
-    def test_separates_distant_words(self):
-        words = [
-            OCRWord(text="سطر1", bbox=[(100, 10), (200, 10), (200, 30), (100, 30)], confidence=0.9),
-            OCRWord(text="سطر2", bbox=[(100, 100), (200, 100), (200, 120), (100, 120)], confidence=0.8),
-        ]
-        lines = _group_words_into_lines(words)
-        assert len(lines) == 2
+        images = [_make_pil_image(), _make_pil_image()]
+        results = run_ocr(images)
 
-    def test_empty_words(self):
-        assert _group_words_into_lines([]) == []
-
-    def test_rtl_ordering(self):
-        """Words should be sorted right-to-left within a line."""
-        words = [
-            OCRWord(text="يسار", bbox=[(50, 10), (100, 10), (100, 30), (50, 30)], confidence=0.9),
-            OCRWord(text="يمين", bbox=[(200, 10), (250, 10), (250, 30), (200, 30)], confidence=0.9),
-        ]
-        lines = _group_words_into_lines(words)
-        assert len(lines) == 1
-        # "يمين" (right) should come first in RTL
-        assert lines[0].text.startswith("يمين")
-
-
-class TestComputeWeightedConfidence:
-    def test_single_word(self):
-        words = [OCRWord(text="test", bbox=[(0, 0), (1, 0), (1, 1), (0, 1)], confidence=0.9)]
-        assert _compute_weighted_confidence(words) == pytest.approx(0.9)
-
-    def test_weighted_by_length(self):
-        words = [
-            OCRWord(text="ab", bbox=[(0, 0), (1, 0), (1, 1), (0, 1)], confidence=1.0),
-            OCRWord(text="abcdef", bbox=[(0, 0), (1, 0), (1, 1), (0, 1)], confidence=0.5),
-        ]
-        # 2*1.0 + 6*0.5 = 5.0 / 8 = 0.625
-        assert _compute_weighted_confidence(words) == pytest.approx(0.625)
-
-    def test_empty(self):
-        assert _compute_weighted_confidence([]) == 0.0
+        assert len(results) == 2
+        assert results[0].page_number == 1
+        assert results[1].page_number == 2
 
 
 class TestComputePageConfidence:
@@ -110,50 +203,30 @@ class TestComputePageConfidence:
         lines = [OCRLine(words=[], text="hello", confidence=0.8)]
         assert _compute_page_confidence(lines) == pytest.approx(0.8)
 
+    def test_weighted_by_length(self):
+        lines = [
+            OCRLine(words=[], text="ab", confidence=1.0),
+            OCRLine(words=[], text="abcdef", confidence=0.5),
+        ]
+        # 2*1.0 + 6*0.5 = 5.0 / 8 = 0.625
+        assert _compute_page_confidence(lines) == pytest.approx(0.625)
+
     def test_empty(self):
         assert _compute_page_confidence([]) == 0.0
 
+    def test_empty_text_lines(self):
+        lines = [OCRLine(words=[], text="", confidence=0.9)]
+        assert _compute_page_confidence(lines) == 0.0
 
-class TestRunOCR:
-    @patch("OCR.engine._get_reader")
-    def test_returns_page_result(self, mock_get_reader):
-        mock_reader = MagicMock()
-        mock_reader.readtext.return_value = [
-            ([[0, 0], [100, 0], [100, 30], [0, 30]], "نص تجريبي", 0.92),
-        ]
-        mock_get_reader.return_value = mock_reader
 
-        img = np.ones((100, 100), dtype=np.uint8) * 255
-        result = run_ocr(img, page_number=1)
+class TestGetEngine:
+    def test_returns_singleton(self):
+        engine1 = get_engine()
+        engine2 = get_engine()
+        assert engine1 is engine2
 
-        assert result.page_number == 1
-        assert len(result.lines) == 1
-        assert "نص تجريبي" in result.raw_text
-        assert result.confidence > 0
-
-    @patch("OCR.engine._get_reader")
-    def test_handles_empty_results(self, mock_get_reader):
-        mock_reader = MagicMock()
-        mock_reader.readtext.return_value = []
-        mock_get_reader.return_value = mock_reader
-
-        img = np.ones((100, 100), dtype=np.uint8) * 255
-        result = run_ocr(img, page_number=1)
-
-        assert result.page_number == 1
-        assert len(result.lines) == 0
-        assert result.raw_text == ""
-        assert result.confidence == 0.0
-
-    @patch("OCR.engine._get_reader")
-    def test_handles_engine_error(self, mock_get_reader):
-        mock_reader = MagicMock()
-        mock_reader.readtext.side_effect = RuntimeError("Engine failure")
-        mock_get_reader.return_value = mock_reader
-
-        img = np.ones((100, 100), dtype=np.uint8) * 255
-        result = run_ocr(img, page_number=1)
-
-        assert result.has_errors is True
-        assert result.confidence == 0.0
-        assert len(result.warnings) > 0
+    def test_reset_creates_new_instance(self):
+        engine1 = get_engine()
+        reset_engine()
+        engine2 = get_engine()
+        assert engine1 is not engine2

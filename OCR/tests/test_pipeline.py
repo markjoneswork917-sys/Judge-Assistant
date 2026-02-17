@@ -1,7 +1,7 @@
 """
-Tests for the OCR pipeline orchestrator.
+Tests for the OCR pipeline orchestrator (Surya-based).
 
-Uses mocking to avoid dependency on actual OCR engine and image files.
+Uses mocking to avoid dependency on actual Surya models and image files.
 """
 
 import os
@@ -58,14 +58,16 @@ def mock_ocr_page_result():
 class TestProcessDocument:
     @patch("OCR.ocr_pipeline.run_ocr")
     @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
     @patch("OCR.ocr_pipeline.preprocess_image")
     def test_returns_document_result(
-        self, mock_preprocess, mock_postprocess, mock_run_ocr,
-        sample_image_path, mock_ocr_page_result
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
     ):
-        mock_preprocess.return_value = np.ones((100, 100), dtype=np.uint8)
-        mock_run_ocr.return_value = mock_ocr_page_result
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
         mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
 
         result = process_document(sample_image_path)
 
@@ -76,14 +78,16 @@ class TestProcessDocument:
 
     @patch("OCR.ocr_pipeline.run_ocr")
     @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
     @patch("OCR.ocr_pipeline.preprocess_image")
     def test_return_for_node0(
-        self, mock_preprocess, mock_postprocess, mock_run_ocr,
-        sample_image_path, mock_ocr_page_result
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
     ):
-        mock_preprocess.return_value = np.ones((100, 100), dtype=np.uint8)
-        mock_run_ocr.return_value = mock_ocr_page_result
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
         mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
 
         result = process_document(sample_image_path, return_for_node0=True)
 
@@ -95,50 +99,74 @@ class TestProcessDocument:
 
     @patch("OCR.ocr_pipeline.run_ocr")
     @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
     @patch("OCR.ocr_pipeline.preprocess_image")
     def test_custom_doc_id(
-        self, mock_preprocess, mock_postprocess, mock_run_ocr,
-        sample_image_path, mock_ocr_page_result
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
     ):
-        mock_preprocess.return_value = np.ones((100, 100), dtype=np.uint8)
-        mock_run_ocr.return_value = mock_ocr_page_result
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
         mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
 
         result = process_document(sample_image_path, doc_id="test-123")
 
         assert result.doc_id == "test-123"
 
+    @patch("OCR.ocr_pipeline.run_ocr")
+    @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
+    @patch("OCR.ocr_pipeline.preprocess_image")
+    def test_accepts_list_of_paths(
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
+    ):
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
+        mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
+
+        result = process_document([sample_image_path])
+
+        assert isinstance(result, OCRDocumentResult)
+        assert result.total_pages == 1
+
 
 class TestProcessBatch:
     @patch("OCR.ocr_pipeline.run_ocr")
     @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
     @patch("OCR.ocr_pipeline.preprocess_image")
     def test_batch_processing(
-        self, mock_preprocess, mock_postprocess, mock_run_ocr,
-        sample_image_path, mock_ocr_page_result
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
     ):
-        mock_preprocess.return_value = np.ones((100, 100), dtype=np.uint8)
-        mock_run_ocr.return_value = mock_ocr_page_result
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
         mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
 
-        results = process_batch([sample_image_path], max_workers=1)
+        results = process_batch([sample_image_path])
 
         assert len(results) == 1
         assert isinstance(results[0], OCRDocumentResult)
 
     @patch("OCR.ocr_pipeline.run_ocr")
     @patch("OCR.ocr_pipeline.postprocess_page")
+    @patch("OCR.ocr_pipeline.postprocess_document_pages")
     @patch("OCR.ocr_pipeline.preprocess_image")
     def test_batch_for_node0(
-        self, mock_preprocess, mock_postprocess, mock_run_ocr,
-        sample_image_path, mock_ocr_page_result
+        self, mock_preprocess, mock_doc_postprocess, mock_postprocess,
+        mock_run_ocr, sample_image_path, mock_ocr_page_result
     ):
-        mock_preprocess.return_value = np.ones((100, 100), dtype=np.uint8)
-        mock_run_ocr.return_value = mock_ocr_page_result
+        mock_preprocess.return_value = Image.new("RGB", (100, 100))
+        mock_run_ocr.return_value = [mock_ocr_page_result]
         mock_postprocess.return_value = mock_ocr_page_result
+        mock_doc_postprocess.return_value = [mock_ocr_page_result]
 
         results = process_batch(
-            [sample_image_path], return_for_node0=True, max_workers=1
+            [sample_image_path], return_for_node0=True
         )
 
         assert isinstance(results, list)

@@ -6,7 +6,7 @@ Configuration module for the OCR pipeline.
 Purpose:
 --------
 Contains all OCR-specific constants and settings used across
-the module, including engine parameters, preprocessing toggles,
+the module, including Surya engine parameters, preprocessing toggles,
 confidence thresholds, and security limits.
 
 Design Principle:
@@ -27,12 +27,12 @@ USE_GPU = True  # Auto-detect CUDA, fallback to CPU
 # -----------------------------
 # Preprocessing
 # -----------------------------
-TARGET_DPI = 300
+ENABLE_RESOLUTION_CHECK = True
+MIN_DPI = 150
 ENABLE_DESKEW = True
-ENABLE_DENOISE = True
+ENABLE_DENOISE = False  # Off by default; Surya is robust
 ENABLE_BORDER_REMOVAL = True
 ENABLE_CONTRAST_ENHANCEMENT = True
-BINARIZATION_METHOD = "otsu"  # otsu | sauvola | adaptive
 
 # -----------------------------
 # Confidence Thresholds
@@ -45,6 +45,7 @@ MEDIUM_CONFIDENCE_THRESHOLD = 0.60
 # -----------------------------
 ENABLE_DICTIONARY_CORRECTION = True
 MAX_LEVENSHTEIN_DISTANCE = 2
+NORMALIZE_DIGITS = "arabic_indic"  # arabic_indic | western | preserve
 
 # -----------------------------
 # Security
@@ -55,6 +56,7 @@ ALLOWED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".pdf"]
 # -----------------------------
 # Performance
 # -----------------------------
+SURYA_BATCH_SIZE = 4  # Pages per batch for GPU inference
 BATCH_WORKERS = 4
 
 # -----------------------------

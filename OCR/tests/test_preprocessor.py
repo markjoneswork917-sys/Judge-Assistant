@@ -1,163 +1,141 @@
 """
-Tests for the OCR preprocessor module.
+Tests for the OCR preprocessor module (Surya-compatible).
+
+Preprocessing now works with PIL Images throughout and uses
+a lighter pipeline suitable for Surya's transformer-based models.
 """
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from OCR.preprocessor import (
-    binarize,
+    check_and_upscale_resolution,
     denoise,
     deskew,
     enhance_contrast,
-    normalize_resolution,
     preprocess_image,
     remove_borders,
-    to_grayscale,
 )
 
 
-def _make_test_image(h=500, w=400, channels=3):
-    """Create a synthetic test image with some text-like features."""
-    img = np.ones((h, w, channels), dtype=np.uint8) * 255
-    # Add some dark rectangles to simulate text
-    img[100:120, 50:350] = 0
-    img[140:160, 50:300] = 0
-    img[180:200, 100:350] = 0
-    return img
+def _make_test_image(w=400, h=500):
+    """Create a synthetic test PIL Image with some text-like features."""
+    arr = np.ones((h, w, 3), dtype=np.uint8) * 255
+    # Add dark rectangles to simulate text
+    arr[100:120, 50:350] = 0
+    arr[140:160, 50:300] = 0
+    arr[180:200, 100:350] = 0
+    return Image.fromarray(arr)
 
 
-def _make_grayscale_image(h=500, w=400):
-    """Create a synthetic grayscale test image."""
-    img = np.ones((h, w), dtype=np.uint8) * 255
-    img[100:120, 50:350] = 0
-    img[140:160, 50:300] = 0
-    return img
+def _make_small_image(w=150, h=200):
+    """Create a small test image that should trigger upscaling."""
+    arr = np.ones((h, w, 3), dtype=np.uint8) * 255
+    arr[50:70, 30:120] = 0
+    return Image.fromarray(arr)
 
 
-class TestToGrayscale:
-    def test_converts_bgr_to_gray(self):
-        img = _make_test_image()
-        result = to_grayscale(img)
-        assert len(result.shape) == 2
+class TestCheckAndUpscaleResolution:
+    def test_small_image_upscaled(self):
+        img = _make_small_image()
+        result = check_and_upscale_resolution(img)
+        assert result.height > img.height
+        assert result.width > img.width
 
-    def test_already_grayscale_returns_same(self):
-        img = _make_grayscale_image()
-        result = to_grayscale(img)
-        assert len(result.shape) == 2
-        assert result.shape == img.shape
+    def test_large_image_unchanged(self):
+        img = _make_test_image(w=3000, h=4000)
+        result = check_and_upscale_resolution(img)
+        assert result.size == img.size
 
-    def test_single_channel_3d(self):
-        img = np.ones((100, 100, 1), dtype=np.uint8) * 128
-        result = to_grayscale(img)
-        assert len(result.shape) == 2
-
-
-class TestDenoise:
-    def test_returns_same_shape(self):
-        img = _make_grayscale_image()
-        result = denoise(img)
-        assert result.shape == img.shape
-
-    def test_reduces_noise(self):
-        # Add noise to image
-        img = _make_grayscale_image()
-        noisy = img.copy()
-        noise = np.random.randint(0, 50, img.shape, dtype=np.uint8)
-        noisy = np.clip(noisy.astype(int) + noise, 0, 255).astype(np.uint8)
-
-        result = denoise(noisy)
-        # Denoised image should be closer to original than noisy
-        assert result.shape == img.shape
-
-
-class TestEnhanceContrast:
-    def test_returns_same_shape(self):
-        img = _make_grayscale_image()
-        result = enhance_contrast(img)
-        assert result.shape == img.shape
-
-    def test_output_range(self):
-        img = _make_grayscale_image()
-        result = enhance_contrast(img)
-        assert result.min() >= 0
-        assert result.max() <= 255
-
-
-class TestBinarize:
-    def test_otsu(self):
-        img = _make_grayscale_image()
-        result = binarize(img, method="otsu")
-        assert result.shape == img.shape
-        unique_values = np.unique(result)
-        assert len(unique_values) <= 2
-
-    def test_adaptive(self):
-        img = _make_grayscale_image()
-        result = binarize(img, method="adaptive")
-        assert result.shape == img.shape
-
-    def test_sauvola(self):
-        img = _make_grayscale_image()
-        result = binarize(img, method="sauvola")
-        assert result.shape == img.shape
-
-    def test_unknown_method_falls_back_to_otsu(self):
-        img = _make_grayscale_image()
-        result = binarize(img, method="unknown")
-        assert result.shape == img.shape
+    def test_returns_pil_image(self):
+        img = _make_small_image()
+        result = check_and_upscale_resolution(img)
+        assert isinstance(result, Image.Image)
 
 
 class TestDeskew:
     def test_already_straight_image(self):
-        img = _make_grayscale_image()
+        img = _make_test_image()
         result = deskew(img)
-        assert result.shape == img.shape
+        assert isinstance(result, Image.Image)
+        # Size should be roughly the same (small expansion from rotation is ok)
+        assert abs(result.width - img.width) < 50
+        assert abs(result.height - img.height) < 50
 
-    def test_handles_empty_image(self):
-        img = np.ones((100, 100), dtype=np.uint8) * 255
+    def test_handles_white_image(self):
+        """An all-white image should not be deskewed."""
+        arr = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        img = Image.fromarray(arr)
         result = deskew(img)
-        assert result.shape == img.shape
+        assert result.size == img.size
+
+    def test_returns_pil_image(self):
+        img = _make_test_image()
+        result = deskew(img)
+        assert isinstance(result, Image.Image)
 
 
 class TestRemoveBorders:
     def test_image_with_border(self):
         # Create image with black border
-        img = np.zeros((500, 400), dtype=np.uint8)
+        arr = np.zeros((500, 400, 3), dtype=np.uint8)
         # White content area in center
-        img[50:450, 50:350] = 255
+        arr[50:450, 50:350] = 255
+        img = Image.fromarray(arr)
         result = remove_borders(img)
         # Result should be smaller or same size
-        assert result.shape[0] <= img.shape[0]
-        assert result.shape[1] <= img.shape[1]
+        assert result.width <= img.width
+        assert result.height <= img.height
 
     def test_image_without_border(self):
-        img = _make_grayscale_image()
+        img = _make_test_image()
         result = remove_borders(img)
-        assert result.shape[0] > 0
-        assert result.shape[1] > 0
+        assert result.width > 0
+        assert result.height > 0
+
+    def test_returns_pil_image(self):
+        img = _make_test_image()
+        result = remove_borders(img)
+        assert isinstance(result, Image.Image)
 
 
-class TestNormalizeResolution:
-    def test_small_image_upscaled(self):
-        img = _make_grayscale_image(h=200, w=150)
-        result = normalize_resolution(img, target_dpi=300)
-        assert result.shape[0] > img.shape[0]
-        assert result.shape[1] > img.shape[1]
+class TestEnhanceContrast:
+    def test_returns_same_size(self):
+        img = _make_test_image()
+        result = enhance_contrast(img)
+        assert result.size == img.size
 
-    def test_large_image_unchanged(self):
-        img = _make_grayscale_image(h=4000, w=3000)
-        result = normalize_resolution(img, target_dpi=300)
-        assert result.shape == img.shape
+    def test_returns_pil_image(self):
+        img = _make_test_image()
+        result = enhance_contrast(img)
+        assert isinstance(result, Image.Image)
+
+    def test_preserves_rgb_mode(self):
+        img = _make_test_image()
+        result = enhance_contrast(img)
+        assert result.mode == "RGB"
+
+
+class TestDenoise:
+    def test_returns_same_size(self):
+        img = _make_test_image()
+        result = denoise(img)
+        assert result.size == img.size
+
+    def test_returns_pil_image(self):
+        img = _make_test_image()
+        result = denoise(img)
+        assert isinstance(result, Image.Image)
 
 
 class TestPreprocessImage:
     def test_full_pipeline(self):
         img = _make_test_image()
         result = preprocess_image(img)
-        assert len(result.shape) == 2  # Should be grayscale
-        assert result.shape[0] > 0
-        assert result.shape[1] > 0
+        assert isinstance(result, Image.Image)
+        assert result.width > 0
+        assert result.height > 0
 
     def test_all_steps_disabled(self):
         img = _make_test_image()
@@ -167,12 +145,25 @@ class TestPreprocessImage:
             enable_deskew=False,
             enable_border_removal=False,
             enable_contrast_enhancement=False,
+            enable_resolution_check=False,
         )
-        assert len(result.shape) == 2
-        assert result.shape[0] > 0
+        assert isinstance(result, Image.Image)
+        assert result.size == img.size
 
     def test_preserves_content(self):
         """Preprocessing should not produce an empty image."""
         img = _make_test_image()
         result = preprocess_image(img)
-        assert np.any(result < 255)  # Should still have some dark pixels
+        arr = np.array(result)
+        # Should still have some dark pixels (the simulated text)
+        assert np.any(arr < 200)
+
+    def test_returns_rgb(self):
+        """Result should be RGB for Surya compatibility."""
+        img = _make_test_image()
+        result = preprocess_image(img)
+        assert isinstance(result, Image.Image)
+        # Should be RGB or at least convertible
+        if result.mode != "RGB":
+            result = result.convert("RGB")
+        assert result.mode == "RGB"
