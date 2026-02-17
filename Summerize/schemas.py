@@ -165,3 +165,41 @@ class RoleThemeSummaries(BaseModel):
 class Node4BOutput(BaseModel):
     """Full output of Node 4B."""
     role_theme_summaries: List[RoleThemeSummaries]
+
+
+# --- Node 5 Output Schemas ---
+
+class CaseBrief(BaseModel):
+    """The 7 sections of the judge-facing brief."""
+    dispute_summary: str = Field(
+        description="ملخص النزاع: فقرة واحدة تلخص جوهر النزاع بين الأطراف"
+    )
+    uncontested_facts: str = Field(
+        description="الوقائع غير المتنازع عليها: الوقائع التي لم ينازع فيها أي طرف"
+    )
+    key_disputes: str = Field(
+        description="نقاط الخلاف الجوهرية: النقاط التي يتناقض فيها الأطراف"
+    )
+    party_requests: str = Field(
+        description="طلبات الخصوم: ما يطلبه كل طرف من المحكمة"
+    )
+    party_defenses: str = Field(
+        description="دفوع الخصوم: الدفوع الشكلية والموضوعية لكل طرف"
+    )
+    submitted_documents: str = Field(
+        description="المستندات المقدمة: المستندات التي قدمها كل طرف"
+    )
+    legal_questions: str = Field(
+        description="الأسئلة القانونية المطروحة: المسائل القانونية التي تحتاج فصلاً"
+    )
+
+
+class Node5Output(BaseModel):
+    """Full output of Node 5."""
+    case_brief: CaseBrief
+    all_sources: List[str] = Field(
+        description="All unique citations referenced across the brief"
+    )
+    rendered_brief: str = Field(
+        description="The full brief rendered as Arabic markdown text"
+    )
