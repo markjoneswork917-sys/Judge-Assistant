@@ -2,7 +2,12 @@ from typing import List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
-from RAG.schemas import LegalRoleEnum
+import sys
+import os
+
+# Add parent directory to path for shared schema imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from schemas import LegalRoleEnum
 
 # Define the output structure for the LLM (Batch)
 class ClassificationItem(BaseModel):
